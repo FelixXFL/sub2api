@@ -137,6 +137,16 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 		if effort := gjson.GetBytes(responsesBody, "reasoning.effort").String(); effort != "" {
 			responsesReq.Reasoning = &apicompat.ResponsesReasoning{Effort: effort}
 		}
+	} else if account.IsOpenAIAPIKeyPassthroughEnabled() {
+		// Passthrough mode: skip CC→Responses conversion, forward raw body to /v1/chat/completions
+		passthroughBody, err := sjson.SetBytes(body, "model", upstreamModel)
+		if err != nil {
+			return nil, fmt.Errorf("rewrite model in passthrough body: %w", err)
+		}
+		passthroughBody, _ = sjson.SetBytes(passthroughBody, "stream", false)
+		responsesBody = passthroughBody
+		clientStream = false
+		isResponsesShape = false
 	} else {
 		// Normal path: convert Chat Completions → Responses.
 		// ChatCompletionsToResponses always sets Stream=true (upstream always streams).
@@ -168,7 +178,7 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	}
 	logger.L().Debug("openai chat_completions: model mapping applied", logFields...)
 
-	if account.Type == AccountTypeOAuth {
+	if account.Type == AccountTypeOAuth && !account.IsOpenAIAPIKeyPassthroughEnabled() {
 		var reqBody map[string]any
 		if err := json.Unmarshal(responsesBody, &reqBody); err != nil {
 			return nil, fmt.Errorf("unmarshal for codex transform: %w", err)
@@ -283,12 +293,14 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	var handleErr error
 	if clientStream {
 		result, handleErr = s.handleChatStreamingResponse(resp, c, originalModel, billingModel, upstreamModel, includeUsage, startTime)
+	} else if account.IsOpenAIAPIKeyPassthroughEnabled() {
+		result, handleErr = s.handlePassthroughResponse(resp, c, upstreamModel, startTime)
 	} else {
 		result, handleErr = s.handleChatBufferedStreamingResponse(resp, c, originalModel, billingModel, upstreamModel, startTime)
 	}
 
 	// Propagate ServiceTier and ReasoningEffort to result for billing
-	if handleErr == nil && result != nil {
+	if handleErr == nil && result != nil && responsesReq != nil {
 		if responsesReq.ServiceTier != "" {
 			st := responsesReq.ServiceTier
 			result.ServiceTier = &st
@@ -682,6 +694,93 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 		}
 	}
 }
+
+// MinimaxChatResponse represents a raw Chat Completions response from Minimax.
+type MinimaxChatResponse struct {
+	ID      string      
+	Model   string      
+	Usage   OpenAIUsage 
+	Choices []struct {
+		Message struct {
+			Content string 
+			Role    string 
+		} 
+		FinishReason string 
+	} 
+}
+
+func parseMinimaxResponse(body []byte) (*MinimaxChatResponse, error) {
+	var resp MinimaxChatResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// handlePassthroughResponse reads a non-SSE JSON response from the upstream
+// (used when OpenAI APIKey passthrough mode is enabled).
+func (s *OpenAIGatewayService) handlePassthroughResponse(
+	resp *http.Response,
+	c *gin.Context,
+	upstreamModel string,
+	startTime time.Time,
+) (*OpenAIForwardResult, error) {
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read passthrough response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return s.handleCompatErrorResponse(resp, c, nil, writeChatCompletionsError)
+	}
+
+	minimaxResp, err := parseMinimaxResponse(body)
+	if err != nil {
+		return nil, fmt.Errorf("parse minimax response: %w", err)
+	}
+
+	chatResp := gin.H{
+		"id":      minimaxResp.ID,
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   upstreamModel,
+		"choices": []gin.H{},
+	}
+
+	usage := OpenAIUsage{}
+	if minimaxResp.Usage.InputTokens != 0 || minimaxResp.Usage.OutputTokens != 0 {
+		usage = minimaxResp.Usage
+		chatResp["usage"] = usage
+	}
+
+	for _, choice := range minimaxResp.Choices {
+		msg := choice.Message
+		chatResp["choices"] = append(chatResp["choices"].([]gin.H), gin.H{
+			"index": 0,
+			"message": gin.H{
+				"role":    msg.Role,
+				"content": msg.Content,
+			},
+			"finish_reason": choice.FinishReason,
+		})
+	}
+
+	if s.responseHeaderFilter != nil {
+		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
+	}
+	c.JSON(http.StatusOK, chatResp)
+
+	return &OpenAIForwardResult{
+		Usage:         usage,
+		Model:         upstreamModel,
+		BillingModel:  upstreamModel,
+		UpstreamModel: upstreamModel,
+		Stream:        false,
+		Duration:      time.Since(startTime),
+	}, nil
+}
+
 
 // writeChatCompletionsError writes an error response in OpenAI Chat Completions format.
 func writeChatCompletionsError(c *gin.Context, statusCode int, errType, message string) {

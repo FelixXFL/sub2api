@@ -3813,7 +3813,17 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 			if err != nil {
 				return nil, err
 			}
-			targetURL = buildOpenAIResponsesURL(validatedURL)
+			if account.IsOpenAIAPIKeyPassthroughEnabled() {
+				// Passthrough mode: use /v1/chat/completions directly instead of /v1/responses
+				normalized := strings.TrimRight(strings.TrimSpace(validatedURL), "/")
+				if strings.HasSuffix(normalized, "/v1") {
+					targetURL = normalized + "/chat/completions"
+				} else {
+					targetURL = normalized + "/v1/chat/completions"
+				}
+			} else {
+				targetURL = buildOpenAIResponsesURL(validatedURL)
+			}
 		}
 	default:
 		targetURL = openaiPlatformAPIURL
