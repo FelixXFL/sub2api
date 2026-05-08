@@ -1,0 +1,22 @@
+[Unit]
+Description=Nexus - AI API Gateway Platform
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/nexus
+ExecStart=/opt/nexus/current
+Restart=on-failure
+RestartSec=10
+Environment=GIN_MODE=release
+Environment=SERVER_HOST=0.0.0.0
+Environment=SERVER_PORT=8080
+Environment=DATA_DIR=/opt/nexus
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
