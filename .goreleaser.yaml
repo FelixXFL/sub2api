@@ -1,16 +1,16 @@
 version: 2
 
-project_name: sub2api
+project_name: nexus
 
 before:
   hooks:
     - go mod tidy -C backend
 
 builds:
-  - id: sub2api
+  - id: nexus
     dir: backend
     main: ./cmd/server
-    binary: sub2api
+    binary: nexus
     flags:
       - -tags=embed
     env:

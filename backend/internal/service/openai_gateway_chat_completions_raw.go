@@ -88,6 +88,10 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 		upstreamBody = ReplaceModelInBody(body, upstreamModel)
 	}
 
+	// 3b. [MiniMax COMPAT] Convert "developer" role to "system" role.
+	// MiniMax API does not support "developer" role (rejects with error 2013).
+	upstreamBody, _, _ = convertDeveloperRoleToSystem(upstreamBody)
+
 	// 4. Apply OpenAI fast policy on the CC body
 	updatedBody, policyErr := s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, upstreamBody)
 	if policyErr != nil {

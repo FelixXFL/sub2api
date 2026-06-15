@@ -2878,6 +2878,11 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		body = sanitizedBody
 	}
 
+	// [TEST-ONLY WORKAROUND] Convert "developer" role to "system" role for MiniMax compatibility.
+	// MiniMax API does not support "developer" role (rejects with error 2013).
+	// This conversion should be removed once MiniMax adds support or proper upstream fix is applied.
+	body, _, _ = convertDeveloperRoleToSystem(body)
+
 	// Apply OpenAI fast policy to the passthrough body (filter/block by service_tier).
 	// 统一使用 upstream 视角的 model：透传路径下 body 已经过 compact 映射 +
 	// OAuth normalize，body 中的 model 字段即上游真正会看到的 slug。
@@ -3813,7 +3818,17 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 			if err != nil {
 				return nil, err
 			}
-			targetURL = buildOpenAIResponsesURL(validatedURL)
+			if account.IsOpenAIAPIKeyPassthroughEnabled() {
+				// Passthrough mode: use /v1/chat/completions directly instead of /v1/responses
+				normalized := strings.TrimRight(strings.TrimSpace(validatedURL), "/")
+				if strings.HasSuffix(normalized, "/v1") {
+					targetURL = normalized + "/chat/completions"
+				} else {
+					targetURL = normalized + "/v1/chat/completions"
+				}
+			} else {
+				targetURL = buildOpenAIResponsesURL(validatedURL)
+			}
 		}
 	default:
 		targetURL = openaiPlatformAPIURL
@@ -6199,6 +6214,60 @@ func sanitizeEmptyBase64InputImagesInOpenAIBody(body []byte) ([]byte, bool, erro
 	normalized, err := json.Marshal(reqBody)
 	if err != nil {
 		return body, false, fmt.Errorf("serialize sanitized request body: %w", err)
+	}
+	return normalized, true, nil
+}
+
+// convertDeveloperRoleToSystem converts "developer" role to "system" role in OpenAI chat completions messages.
+// This is a temporary test workaround for MiniMax API which does not support the "developer" role.
+// MiniMax only supports: system, user, assistant.
+// OpenAI's new format uses "developer" role which MiniMax rejects with: invalid role: developer (2013)
+//
+// TODO: This is a TEST-ONLY workaround. Remove this conversion when MiniMax adds support
+// for the "developer" role or when proper role mapping is implemented upstream.
+func convertDeveloperRoleToSystem(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 {
+		return body, false, nil
+	}
+	if !bytes.Contains(body, []byte(`"role"`)) || !bytes.Contains(body, []byte(`"developer"`)) {
+		return body, false, nil
+	}
+
+	var reqBody map[string]any
+	if err := json.Unmarshal(body, &reqBody); err != nil {
+		return body, false, fmt.Errorf("convert developer role: %w", err)
+	}
+
+	messages, ok := reqBody["messages"]
+	if !ok {
+		return body, false, nil
+	}
+
+	messageList, ok := messages.([]any)
+	if !ok {
+		return body, false, nil
+	}
+
+	changed := false
+	for i, msg := range messageList {
+		msgMap, ok := msg.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, ok := msgMap["role"].(string); ok && role == "developer" {
+			msgMap["role"] = "system"
+			messageList[i] = msgMap
+			changed = true
+		}
+	}
+
+	if !changed {
+		return body, false, nil
+	}
+
+	normalized, err := json.Marshal(reqBody)
+	if err != nil {
+		return body, false, fmt.Errorf("serialize converted request body: %w", err)
 	}
 	return normalized, true, nil
 }
